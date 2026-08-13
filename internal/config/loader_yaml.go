@@ -62,6 +62,17 @@ type YAMLConfig struct {
 		TrustedProxies        []string `yaml:"trusted_proxies"`
 	} `yaml:"security"`
 
+	// Connect configures CONNECT tunnelling for HTTPS-only repositories.
+	// Enabled is a pointer so "absent" is distinguishable from an explicit
+	// "enabled: false"; the CLI/ENV layer must be able to win either way.
+	Connect struct {
+		Enabled        *bool    `yaml:"enabled"`
+		AllowedHosts   []string `yaml:"allowed_hosts"`
+		AllowedPorts   []int    `yaml:"allowed_ports"`
+		MaxConcurrent  *int     `yaml:"max_concurrent"`
+		IdleTimeoutSec *int     `yaml:"idle_timeout_sec"`
+	} `yaml:"connect"`
+
 	Storage struct {
 		Backend string `yaml:"backend"`
 		S3      struct {
@@ -194,7 +205,24 @@ func yamlConfigToConfig(yamlCfg *YAMLConfig) *Config {
 				TempDir:      yamlCfg.Storage.S3.TempDir,
 			},
 		},
+		Connect: ConnectConfig{
+			AllowedHosts: append([]string(nil), yamlCfg.Connect.AllowedHosts...),
+			AllowedPorts: append([]int(nil), yamlCfg.Connect.AllowedPorts...),
+		},
 		DistributionsConfigPath: yamlCfg.DistributionsConfig,
+	}
+
+	// Pointers throughout: an absent key must stay distinguishable from an
+	// explicit 0, which the user-facing schema defines as "off".
+	if yamlCfg.Connect.Enabled != nil {
+		cfg.Connect.Enabled = *yamlCfg.Connect.Enabled
+	}
+	if yamlCfg.Connect.MaxConcurrent != nil {
+		cfg.Connect.MaxConcurrent = connectOff(*yamlCfg.Connect.MaxConcurrent)
+	}
+	if yamlCfg.Connect.IdleTimeoutSec != nil {
+		cfg.Connect.IdleTimeoutSec = connectOff(*yamlCfg.Connect.IdleTimeoutSec)
+		cfg.Connect.IdleTimeout = connectIdleDuration(cfg.Connect.IdleTimeoutSec)
 	}
 
 	// Apply UpstreamKeepAlive: default to true (matches CLI default) so the

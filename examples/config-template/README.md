@@ -39,4 +39,5 @@ So a flag (e.g. `--port=8000`) always wins over the same key in this YAML.
   `cn:tsinghua`).
 - `tls:` — terminate HTTPS at apt-proxy itself.
 - `security:` — API key for protected `/api/*` endpoints.
+- `connect:` — CONNECT tunnelling for HTTPS-only repositories (disabled by default, allowlisted when enabled).
 - `mode:` — restrict to a single distro family or serve them all.

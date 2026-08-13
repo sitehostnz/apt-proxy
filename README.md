@@ -324,6 +324,11 @@ View all available options:
 | `-api-rate-limit` | API requests per IP per minute (`0` to disable) | `60` |
 | `-trusted-proxies` | Comma-separated CIDRs whose `X-Forwarded-For` is honored by rate limiter and auth | |
 | `-upstream-keep-alive` | Enable HTTP keep-alive to upstream mirrors | `true` |
+| `-connect` | Enable HTTP CONNECT tunnelling for HTTPS-only repositories (see [HTTPS Repositories](#https-repositories-connect-tunnelling)) | `false` |
+| `-connect-allow` | Comma-separated destination allowlist, e.g. `download.docker.com,*.saltproject.io`. Empty denies everything | (deny all) |
+| `-connect-ports` | Comma-separated destination port allowlist | `443` |
+| `-connect-max-concurrent` | Maximum simultaneously open tunnels (`0` for unlimited) | `256` |
+| `-connect-idle-timeout` | Tear down a tunnel after this many seconds of inactivity (`0` disables) | `120` |
 | `-storage-backend` | Cache storage backend: `disk` or `s3` (see [S3 Storage Backend](#s3-storage-backend)) | `disk` |
 | `-s3-endpoint` | S3 endpoint host[:port] (required when backend is `s3`) | |
 | `-s3-region` | S3 region (required for AWS S3, ignored by most MinIO services) | |
@@ -395,6 +400,16 @@ Every CLI flag has an equivalent environment variable. Plus a few extras for log
 | `APT_PROXY_ENABLE_API_AUTH` | `-enable-api-auth` | Explicit toggle for API auth middleware |
 | `APT_PROXY_API_RATE_LIMIT_PER_MINUTE` | `-api-rate-limit` | API requests per IP per minute (`0` disables) |
 | `APT_PROXY_TRUSTED_PROXIES` | `-trusted-proxies` | Comma-separated trusted proxy CIDRs |
+
+**CONNECT tunnelling (HTTPS repositories)**
+
+| Variable | Equivalent flag | Description |
+|----------|-----------------|-------------|
+| `APT_PROXY_CONNECT` | `-connect` | Enable CONNECT tunnelling |
+| `APT_PROXY_CONNECT_ALLOW` | `-connect-allow` | Comma-separated destination allowlist (empty denies all) |
+| `APT_PROXY_CONNECT_PORTS` | `-connect-ports` | Comma-separated destination port allowlist |
+| `APT_PROXY_CONNECT_MAX_CONCURRENT` | `-connect-max-concurrent` | Maximum simultaneously open tunnels (`0` for unlimited) |
+| `APT_PROXY_CONNECT_IDLE_TIMEOUT` | `-connect-idle-timeout` | Tunnel inactivity timeout in seconds (`0` disables) |
 
 **Storage Backend**
 
@@ -781,6 +796,74 @@ curl -X POST http://localhost:3142/api/mirrors/refresh
 
 Both paths are equivalent: they reload `distributions.yaml` and re-run mirror selection. SIGHUP signals are debounced (consecutive signals within ~500ms are coalesced) and queued (at most one extra reload is scheduled while a reload is in progress), so it is safe to invoke them rapidly from scripts.
 
+## HTTPS Repositories (CONNECT tunnelling)
+
+Some repositories are published only over HTTPS. Docker and Salt are the common examples, as are most third-party vendor repositories.
+
+When apt is configured to use a proxy and a source uses `https://`, apt does not send a normal `GET`. It sends `CONNECT download.docker.com:443` and expects the proxy to open a raw TCP tunnel, after which apt and the origin perform their own TLS handshake end to end. Without CONNECT support those repositories are unreachable through the proxy.
+
+### Caching Behaviour
+
+The bytes crossing a tunnel are TLS between apt and the origin. The proxy relays them without being able to read them, so:
+
+- **Tunnelled repositories are reachable.** `apt-get update` and `apt-get install` work against HTTPS-only sources.
+- **Tunnelled repositories are not cached.** Every client fetches from the origin independently.
+
+This matches apt-cacher-ng's `PassThroughPattern` behaviour. If you want an HTTPS repository *cached*, point apt at a plain-HTTP path on apt-proxy and configure an HTTPS upstream mirror instead, so apt-proxy makes the TLS connection itself and can see the response.
+
+### Enabling CONNECT
+
+Tunnelling is **disabled by default**, and when enabled it **denies every destination that is not explicitly allowlisted**. This is deliberate. A CONNECT proxy that accepts arbitrary destinations is an open relay: anyone who can reach the proxy could use it to reach any host and port on the internet, or to pivot into your internal network. apt-proxy is typically reachable by every machine on a network, which makes that a bad default.
+
+Note that the allowlist matches **names, not addresses**. An allowlisted name that resolves to an internal address (through split-horizon DNS, or a record you do not control) will still be dialled. Where that matters, network egress policy is the control, not proxy configuration.
+
+```bash
+./apt-proxy \
+  --connect \
+  --connect-allow "download.docker.com,*.saltproject.io"
+```
+
+Then point apt at the proxy as usual:
+
+```bash
+export http_proxy=http://your-domain-or-ip-address:3142
+export https_proxy=http://your-domain-or-ip-address:3142
+apt-get update
+```
+
+### Allowlist Syntax
+
+| Pattern | Matches | Does not match |
+|---------|---------|----------------|
+| `download.docker.com` | that host exactly | any other host |
+| `*.saltproject.io` | `repo.saltproject.io`, `deep.repo.saltproject.io` | `saltproject.io` (list it separately if wanted) |
+
+Matching is case-insensitive and is done on labels, so `*.docker.com` does not match `docker.com.example.net`.
+
+A bare `*`, a malformed `*foo`, and a whole-TLD `*.com` are rejected at startup. Treat that as a typo guard rather than a safety net: `*.co.nz` is just as broad and passes. Review your allowlist.
+
+Only port `443` is permitted unless `--connect-ports` says otherwise. Ports such as `25` are refused even for an allowlisted host.
+
+### Response Codes
+
+| Status | Meaning |
+|--------|---------|
+| `200 Connection Established` | Tunnel is open |
+| `400 Bad Request` | Malformed CONNECT target |
+| `403 Forbidden` | Destination host or port is not allowlisted |
+| `405 Method Not Allowed` | CONNECT tunnelling is disabled |
+| `502 Bad Gateway` | Upstream refused the connection |
+| `503 Service Unavailable` | `--connect-max-concurrent` reached |
+| `504 Gateway Timeout` | Upstream dial timed out |
+
+Failures return promptly rather than hanging, so a broken repository cannot stall an `apt-get update` indefinitely.
+
+### Limits and Monitoring
+
+Every open tunnel holds a file descriptor, so tunnel count is worth watching. Two limits bound it: `--connect-max-concurrent` caps how many can be open at once, and `--connect-idle-timeout` reclaims tunnels that have carried no traffic in either direction. The live count is exported as `apt_proxy_connect_tunnels_active` (see [Observability](#observability)).
+
+Tunnels are not drained on shutdown. An in-flight transfer is cut when the daemon stops, and apt retries.
+
 ## Observability
 
 ### Metrics
@@ -795,6 +878,7 @@ The `/metrics` endpoint exposes Prometheus metrics. Key metrics and suggested al
 | `apt_proxy_cache_cleanup_duration_seconds` | Periodic cleanup duration | Cleanup taking too long |
 | `apt_proxy_cache_upstream_request_duration_seconds{method,status}` | Upstream request latency by method/status | P99 above threshold |
 | `apt_proxy_cache_upstream_errors_total` | Upstream fetch errors | Error rate spike |
+| `apt_proxy_connect_tunnels_active` | Open CONNECT tunnels (see [HTTPS Repositories](#https-repositories-connect-tunnelling)) | Sustained growth alongside process FD count |
 | Health (`/healthz`, `/readyz`) | Service and dependency health | Probes failing |
 
 Exact labels and additional series are emitted by the underlying [httpcache-kit](https://github.com/soulteary/httpcache-kit); scrape `/metrics` to enumerate them.
@@ -862,6 +946,7 @@ apt-proxy/
 │   ├── benchmarks/           # Mirror benchmarking (sync & async)
 │   ├── cli/                  # CLI and daemon management
 │   │   ├── cli.go            # Entrypoint, version wiring
+│   │   ├── connect.go        # CONNECT tunnel handler (Fiber hijack binding)
 │   │   ├── daemon.go         # Server lifecycle, routing, signal handling
 │   │   └── health.go         # Custom Fiber health handler (race-safe shutdown)
 │   ├── config/               # Configuration management
@@ -896,7 +981,8 @@ apt-proxy/
 │   │   ├── page.go           # Home page rendering
 │   │   └── stats.go          # Statistics
 │   ├── state/                # Per-Server runtime state (proxy mode, mirror URLs)
-│   └── system/               # System utilities (disk, gc, filesize)
+│   ├── system/               # System utilities (disk, gc, filesize)
+│   └── tunnel/               # CONNECT tunnelling (allowlist, limits, byte pump)
 ├── tests/                    # Integration tests
 │   └── integration/          # End-to-end tests
 └── config/, docker/, examples/ # Sample configs, deployment, and runnable examples

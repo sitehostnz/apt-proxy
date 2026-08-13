@@ -43,6 +43,13 @@ const (
 	EnvAPIRateLimitPerMinute = "APT_PROXY_API_RATE_LIMIT_PER_MINUTE"
 	EnvTrustedProxies        = "APT_PROXY_TRUSTED_PROXIES"
 
+	// CONNECT tunnelling environment variables
+	EnvConnectEnabled       = "APT_PROXY_CONNECT"
+	EnvConnectAllowedHosts  = "APT_PROXY_CONNECT_ALLOW"
+	EnvConnectAllowedPorts  = "APT_PROXY_CONNECT_PORTS"
+	EnvConnectMaxConcurrent = "APT_PROXY_CONNECT_MAX_CONCURRENT"
+	EnvConnectIdleTimeout   = "APT_PROXY_CONNECT_IDLE_TIMEOUT"
+
 	// Configuration file environment variable
 	EnvConfigFile = "APT_PROXY_CONFIG_FILE"
 
@@ -100,6 +107,11 @@ const (
 	// significant: it keeps every cached body/header inside a single
 	// "folder" so the bucket can be shared with other tooling.
 	DefaultS3Prefix = "apt-proxy/"
+
+	// CONNECT tunnelling defaults; see ConnectConfig for the security model.
+	DefaultConnectEnabled        = false
+	DefaultConnectMaxConcurrent  = 256
+	DefaultConnectIdleTimeoutSec = 120
 )
 
 // Environment variable names for logging configuration. The historical names

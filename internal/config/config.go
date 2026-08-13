@@ -34,9 +34,36 @@ type Config struct {
 	Storage                 StorageConfig  `yaml:"storage"`
 	TLS                     TLSConfig      `yaml:"tls"`
 	Security                SecurityConfig `yaml:"security"`
+	Connect                 ConnectConfig  `yaml:"connect"`
 	DistributionsConfigPath string         `yaml:"distributions_config"`
 	// UpstreamKeepAlive enables HTTP keep-alive to upstream mirrors (default true).
 	UpstreamKeepAlive bool `yaml:"upstream_keep_alive"`
+}
+
+// ConnectConfig is the user-facing form of tunnel.Config; see that package
+// for the security model. Tunnelled traffic is TLS between apt and the
+// origin, so it is relayed but never cached.
+type ConnectConfig struct {
+	Enabled bool `yaml:"enabled"`
+
+	// AllowedHosts entries are an exact hostname or a "*." wildcard.
+	// Empty denies everything.
+	AllowedHosts []string `yaml:"allowed_hosts"`
+
+	// AllowedPorts defaults to 443 only.
+	AllowedPorts []int `yaml:"allowed_ports"`
+
+	// MaxConcurrent caps simultaneously open tunnels. Users write 0 for
+	// unlimited; connectOff turns that into a negative on the way in, so
+	// within Config a 0 only ever means "unset".
+	MaxConcurrent int `yaml:"max_concurrent"`
+
+	// IdleTimeoutSec tears down tunnels carrying no traffic. Same sentinel
+	// handling as MaxConcurrent.
+	IdleTimeoutSec int `yaml:"idle_timeout_sec"`
+
+	// IdleTimeout is the resolved form of IdleTimeoutSec.
+	IdleTimeout time.Duration `yaml:"-"`
 }
 
 // StorageConfig selects and configures the cache storage backend.

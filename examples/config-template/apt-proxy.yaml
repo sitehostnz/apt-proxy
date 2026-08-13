@@ -118,6 +118,38 @@ security:
   #   - 10.0.0.0/8
   #   - 192.168.0.0/16
 
+# CONNECT tunnelling for HTTPS-only repositories (Docker, Salt, most vendor
+# repos). apt sends CONNECT when a source uses https:// and a proxy is set.
+#
+# Tunnelled traffic is TLS between apt and the origin, so it is relayed but
+# NOT cached. This makes those repositories reachable, not faster.
+#
+# Disabled by default. Once enabled, every destination that is not listed in
+# allowed_hosts is refused: a CONNECT proxy that accepts arbitrary
+# destinations is an open relay.
+connect:
+  enabled: false
+
+  # Destination allowlist. Exact hostnames, or "*.example.com" to match
+  # subdomains (but not the bare domain). An empty list denies everything.
+  # A bare "*" or a whole-TLD "*.com" is rejected at startup, but that is a
+  # typo guard rather than a safety net: review your allowlist.
+  # allowed_hosts:
+  #   - download.docker.com
+  #   - "*.saltproject.io"
+
+  # Destination port allowlist. Defaults to 443 only.
+  # allowed_ports:
+  #   - 443
+
+  # Cap on simultaneously open tunnels. Each one holds a file descriptor.
+  # 0 means unlimited.
+  max_concurrent: 256
+
+  # Tear down tunnels carrying no traffic in either direction for this long,
+  # so a stalled client cannot pin a file descriptor open. 0 disables.
+  idle_timeout_sec: 120
+
 # Upstream transport
 # HTTP keep-alive to upstream mirrors. Disable only if a proxy / firewall
 # in front mishandles persistent connections.
