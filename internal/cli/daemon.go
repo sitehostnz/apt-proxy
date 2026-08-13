@@ -27,6 +27,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
+	"github.com/prometheus/client_golang/prometheus"
 	health "github.com/soulteary/health-kit"
 	logger "github.com/soulteary/logger-kit"
 	metrics "github.com/soulteary/metrics-kit"
@@ -41,6 +42,7 @@ import (
 	"github.com/soulteary/apt-proxy/internal/proxy"
 	"github.com/soulteary/apt-proxy/internal/state"
 	"github.com/soulteary/apt-proxy/internal/storage/s3vfs"
+	"github.com/soulteary/apt-proxy/internal/tunnel"
 	httpcache "github.com/soulteary/httpcache-kit"
 	vfs "github.com/soulteary/vfs-kit"
 )
@@ -63,6 +65,7 @@ type Server struct {
 	mirrorsHandler      *api.MirrorsHandler      // Mirrors API handler
 	authMiddleware      *api.AuthMiddleware      // API authentication middleware
 	rateLimitMiddleware *api.RateLimitMiddleware // API rate limit (per IP)
+	tunnel              *tunnel.Tunneler         // CONNECT tunnelling (HTTPS repositories)
 }
 
 // NewServer creates and initializes a new Server instance with the provided
@@ -255,10 +258,37 @@ func (s *Server) initialize() error {
 		s.config.Security.TrustedProxies...,
 	)
 
+	// Always constructed, so a disabled tunnel reports 405 rather than
+	// falling through to the proxy and producing a confusing error.
+	s.tunnel = tunnel.New(tunnel.Config{
+		Enabled:       s.config.Connect.Enabled,
+		AllowedHosts:  s.config.Connect.AllowedHosts,
+		AllowedPorts:  s.config.Connect.AllowedPorts,
+		MaxConcurrent: s.config.Connect.MaxConcurrent,
+		IdleTimeout:   s.config.Connect.IdleTimeout,
+	}, nil)
+	s.registerTunnelMetrics()
+
 	// Create Fiber app with all routes
 	s.app = s.createFiberApp()
 
 	return nil
+}
+
+// registerTunnelMetrics publishes the live tunnel count.
+func (s *Server) registerTunnelMetrics() {
+	if s.metricsRegistry == nil || s.tunnel == nil {
+		return
+	}
+	tn := s.tunnel
+	s.metricsRegistry.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: s.metricsRegistry.Namespace(),
+			Name:      "connect_tunnels_active",
+			Help:      "Number of CONNECT tunnels currently open.",
+		},
+		func() float64 { return float64(tn.Active()) },
+	))
 }
 
 // initHealthChecks initializes the health check aggregator
@@ -456,6 +486,10 @@ func (s *Server) createFiberApp() *fiber.App {
 	})
 	// Static assets (must be registered before the catch-all proxy below).
 	app.Get("/static/apt-proxy-logo.png", adaptor.HTTPHandler(http.HandlerFunc(proxy.ServeStaticLogo)))
+	// Registered before the catch-all, and deliberately a native Fiber
+	// handler: the net/http adaptor cannot hijack a connection, which
+	// tunnelling requires.
+	app.Connect("/*", s.handleConnect)
 	// All other paths -> proxy + cache
 	app.All("/*", adaptor.HTTPHandler(s.proxy.Handler))
 

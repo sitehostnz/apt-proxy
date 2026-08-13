@@ -100,6 +100,23 @@ func MergeConfigsWithExplicit(base, override *Config, ex *cliExplicit) *Config {
 		result.DistributionsConfigPath = override.DistributionsConfigPath
 	}
 
+	if ex.ConnectEnabled {
+		result.Connect.Enabled = override.Connect.Enabled
+	}
+	if ex.ConnectAllowedHosts {
+		result.Connect.AllowedHosts = append([]string(nil), override.Connect.AllowedHosts...)
+	}
+	if ex.ConnectAllowedPorts {
+		result.Connect.AllowedPorts = append([]int(nil), override.Connect.AllowedPorts...)
+	}
+	if ex.ConnectMaxConcurrent {
+		result.Connect.MaxConcurrent = override.Connect.MaxConcurrent
+	}
+	if ex.ConnectIdleTimeout {
+		result.Connect.IdleTimeoutSec = override.Connect.IdleTimeoutSec
+		result.Connect.IdleTimeout = override.Connect.IdleTimeout
+	}
+
 	if ex.StorageBackend && override.Storage.Backend != "" {
 		result.Storage.Backend = override.Storage.Backend
 	}
@@ -232,6 +249,26 @@ func MergeConfigs(base, override *Config) *Config {
 	// a true value from base.
 	if override.UpstreamKeepAlive {
 		result.UpstreamKeepAlive = override.UpstreamKeepAlive
+	}
+
+	// CONNECT: same non-zero-wins rule. Enabling can be merged up from an
+	// override, but a false there cannot disable a base that enabled it;
+	// MergeConfigsWithExplicit is the path that handles that correctly.
+	if override.Connect.Enabled {
+		result.Connect.Enabled = override.Connect.Enabled
+	}
+	if len(override.Connect.AllowedHosts) > 0 {
+		result.Connect.AllowedHosts = append([]string(nil), override.Connect.AllowedHosts...)
+	}
+	if len(override.Connect.AllowedPorts) > 0 {
+		result.Connect.AllowedPorts = append([]int(nil), override.Connect.AllowedPorts...)
+	}
+	if override.Connect.MaxConcurrent != 0 {
+		result.Connect.MaxConcurrent = override.Connect.MaxConcurrent
+	}
+	if override.Connect.IdleTimeoutSec != 0 {
+		result.Connect.IdleTimeoutSec = override.Connect.IdleTimeoutSec
+		result.Connect.IdleTimeout = override.Connect.IdleTimeout
 	}
 
 	// Storage backend: override only when non-empty/non-zero values are

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,6 +110,20 @@ func defineFlags(flags *flag.FlagSet) {
 	// Upstream: keep-alive to mirrors (default true)
 	flags.Bool("upstream-keep-alive", true, "enable HTTP keep-alive to upstream mirrors")
 
+	// CONNECT tunnelling for HTTPS repositories. Disabled by default, and
+	// default-deny once enabled, so a proxy cannot become an open relay by
+	// accident.
+	flags.Bool("connect", DefaultConnectEnabled,
+		"enable HTTP CONNECT tunnelling so apt can reach HTTPS-only repositories (not cacheable)")
+	flags.String("connect-allow", "",
+		"comma-separated destination allowlist for CONNECT, e.g. download.docker.com,*.saltproject.io (empty denies all)")
+	flags.String("connect-ports", "443",
+		"comma-separated destination port allowlist for CONNECT")
+	flags.Int("connect-max-concurrent", DefaultConnectMaxConcurrent,
+		"maximum simultaneously open CONNECT tunnels (0 = unlimited)")
+	flags.Int("connect-idle-timeout", DefaultConnectIdleTimeoutSec,
+		"tear down a CONNECT tunnel after this many seconds of inactivity (0 disables)")
+
 	// Storage backend selection (disk | s3). Empty/disk = local filesystem.
 	flags.String("storage-backend", DefaultStorageBackend, "cache storage backend: disk | s3")
 
@@ -156,6 +171,13 @@ var flagGroups = []struct {
 	{
 		title: "Upstream",
 		flags: []string{"upstream-keep-alive"},
+	},
+	{
+		title: "CONNECT tunnelling (HTTPS repositories; not cacheable)",
+		flags: []string{
+			"connect", "connect-allow", "connect-ports",
+			"connect-max-concurrent", "connect-idle-timeout",
+		},
 	},
 	{
 		title: "Storage backend (disk | s3)",
@@ -239,6 +261,37 @@ func printFlag(out io.Writer, f *flag.Flag) {
 	}
 }
 
+// splitCSV splits a comma-separated flag/ENV value, trimming whitespace and
+// dropping blank entries so a stray trailing comma cannot introduce an empty
+// item. Returns nil (not an empty slice) when nothing usable is present.
+func splitCSV(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if v := strings.TrimSpace(part); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// parsePortCSV converts a comma-separated port list into ints. A bad entry
+// is an error rather than a silent drop: dropping it would quietly narrow
+// the allowlist and change which repositories are reachable.
+func parsePortCSV(raw string) ([]int, error) {
+	var out []int
+	for _, part := range splitCSV(raw) {
+		port, err := strconv.Atoi(part)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid port %q: expected 1-65535", part)
+		}
+		out = append(out, port)
+	}
+	return out, nil
+}
+
 // cliExplicit tracks which fields were explicitly set on the CLI / via ENV.
 // This lets MergeConfigsWithExplicit distinguish "user wrote false/0" from
 // "field defaulted to false/0", which the legacy MergeConfigs cannot.
@@ -264,6 +317,12 @@ type cliExplicit struct {
 	TrustedProxies        bool
 	UpstreamKeepAlive     bool
 	DistributionsConfig   bool
+
+	ConnectEnabled       bool
+	ConnectAllowedHosts  bool
+	ConnectAllowedPorts  bool
+	ConnectMaxConcurrent bool
+	ConnectIdleTimeout   bool
 
 	StorageBackend bool
 	S3Endpoint     bool
@@ -307,7 +366,7 @@ func flagOrEnvSet(flags *flag.FlagSet, name, env string) bool {
 // Default values are used when flags/env vars are not set.
 // The returned cliExplicit mask records which fields were explicitly set
 // (CLI flag or ENV) so MergeConfigsWithExplicit can honor false/0 overrides.
-func buildCLIConfig(flags *flag.FlagSet, defaultHost, defaultPort, defaultCacheDir string, defaultCacheMaxSizeGB int64, defaultCacheTTLHours, defaultCacheCleanupIntervalMin int) (*Config, *cliExplicit) {
+func buildCLIConfig(flags *flag.FlagSet, defaultHost, defaultPort, defaultCacheDir string, defaultCacheMaxSizeGB int64, defaultCacheTTLHours, defaultCacheCleanupIntervalMin int) (*Config, *cliExplicit, error) {
 	ex := &cliExplicit{
 		Debug:                 flagOrEnvSet(flags, "debug", EnvDebug),
 		CacheDir:              flagOrEnvSet(flags, "cachedir", EnvCacheDir),
@@ -329,6 +388,12 @@ func buildCLIConfig(flags *flag.FlagSet, defaultHost, defaultPort, defaultCacheD
 		TrustedProxies:        flagOrEnvSet(flags, "trusted-proxies", EnvTrustedProxies),
 		UpstreamKeepAlive:     flagOrEnvSet(flags, "upstream-keep-alive", EnvUpstreamKeepAlive),
 		DistributionsConfig:   flagOrEnvSet(flags, "distributions-config", EnvDistributionsConfig),
+
+		ConnectEnabled:       flagOrEnvSet(flags, "connect", EnvConnectEnabled),
+		ConnectAllowedHosts:  flagOrEnvSet(flags, "connect-allow", EnvConnectAllowedHosts),
+		ConnectAllowedPorts:  flagOrEnvSet(flags, "connect-ports", EnvConnectAllowedPorts),
+		ConnectMaxConcurrent: flagOrEnvSet(flags, "connect-max-concurrent", EnvConnectMaxConcurrent),
+		ConnectIdleTimeout:   flagOrEnvSet(flags, "connect-idle-timeout", EnvConnectIdleTimeout),
 
 		StorageBackend: flagOrEnvSet(flags, "storage-backend", EnvStorageBackend),
 		S3Endpoint:     flagOrEnvSet(flags, "s3-endpoint", EnvS3Endpoint),
@@ -389,15 +454,17 @@ func buildCLIConfig(flags *flag.FlagSet, defaultHost, defaultPort, defaultCacheD
 	}
 	apiRateLimitPerMinute := configutil.ResolveInt(flags, "api-rate-limit", EnvAPIRateLimitPerMinute, DefaultAPIRateLimitPerMinute, true)
 	upstreamKeepAlive := configutil.ResolveBool(flags, "upstream-keep-alive", EnvUpstreamKeepAlive, true)
-	trustedProxiesRaw := configutil.ResolveString(flags, "trusted-proxies", EnvTrustedProxies, "", true)
-	var trustedProxies []string
-	if trustedProxiesRaw != "" {
-		for _, p := range strings.Split(trustedProxiesRaw, ",") {
-			if v := strings.TrimSpace(p); v != "" {
-				trustedProxies = append(trustedProxies, v)
-			}
-		}
+	trustedProxies := splitCSV(configutil.ResolveString(flags, "trusted-proxies", EnvTrustedProxies, "", true))
+
+	// Resolve CONNECT tunnelling configuration
+	connectEnabled := configutil.ResolveBool(flags, "connect", EnvConnectEnabled, DefaultConnectEnabled)
+	connectAllowedHosts := splitCSV(configutil.ResolveString(flags, "connect-allow", EnvConnectAllowedHosts, "", true))
+	connectAllowedPorts, err := parsePortCSV(configutil.ResolveString(flags, "connect-ports", EnvConnectAllowedPorts, "", true))
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect-ports: %w", err)
 	}
+	connectMaxConcurrent := configutil.ResolveInt(flags, "connect-max-concurrent", EnvConnectMaxConcurrent, DefaultConnectMaxConcurrent, true)
+	connectIdleTimeoutSec := configutil.ResolveInt(flags, "connect-idle-timeout", EnvConnectIdleTimeout, DefaultConnectIdleTimeoutSec, true)
 
 	// Resolve storage backend configuration
 	storageBackend := configutil.ResolveString(flags, "storage-backend", EnvStorageBackend, DefaultStorageBackend, true)
@@ -440,6 +507,14 @@ func buildCLIConfig(flags *flag.FlagSet, defaultHost, defaultPort, defaultCacheD
 			APIRateLimitPerMinute: apiRateLimitPerMinute,
 			TrustedProxies:        trustedProxies,
 		},
+		Connect: ConnectConfig{
+			Enabled:        connectEnabled,
+			AllowedHosts:   connectAllowedHosts,
+			AllowedPorts:   connectAllowedPorts,
+			MaxConcurrent:  connectOff(connectMaxConcurrent),
+			IdleTimeoutSec: connectOff(connectIdleTimeoutSec),
+			IdleTimeout:    connectIdleDuration(connectOff(connectIdleTimeoutSec)),
+		},
 		Storage: StorageConfig{
 			Backend: storageBackend,
 			S3: S3Config{
@@ -475,5 +550,5 @@ func buildCLIConfig(flags *flag.FlagSet, defaultHost, defaultPort, defaultCacheD
 		config.Listen = mirrors.BuildListenAddress(host, port)
 	}
 
-	return config, ex
+	return config, ex, nil
 }

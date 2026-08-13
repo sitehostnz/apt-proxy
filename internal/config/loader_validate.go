@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/soulteary/apt-proxy/internal/distro"
 	"github.com/soulteary/apt-proxy/internal/state"
@@ -129,5 +130,57 @@ func ValidateConfig(config *Config) error {
 		}
 	}
 
+	if err := validateConnect(&config.Connect); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateConnect checks the CONNECT tunnelling settings. It only rejects
+// values that would make tunnelling behave unpredictably; an empty allowlist
+// is valid and means "deny everything", which is the documented default.
+func validateConnect(cfg *ConnectConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+
+	for _, port := range cfg.AllowedPorts {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("connect: allowed port %d is out of range (1-65535)", port)
+		}
+	}
+
+	for _, raw := range cfg.AllowedHosts {
+		// Normalise exactly as the matcher does, or a stray space slips a
+		// pattern past the guard and into a live allowlist entry.
+		host := strings.ToLower(strings.TrimSpace(raw))
+		if host == "" {
+			return fmt.Errorf("connect: allowed_hosts contains an empty entry")
+		}
+		// Catch the obvious over-broad patterns: a bare "*", a malformed
+		// "*foo", or a wildcard covering a whole TLD. This is a typo guard,
+		// not a security boundary -- "*.co.nz" is just as broad and passes.
+		if err := checkWildcardBreadth(host); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// checkWildcardBreadth rejects allowlist patterns broad enough that they
+// almost certainly mean something the operator did not intend.
+func checkWildcardBreadth(host string) error {
+	if !strings.HasPrefix(host, "*") {
+		return nil
+	}
+	if !strings.HasPrefix(host, "*.") {
+		return fmt.Errorf("connect: allowed_hosts entry %q is not a valid wildcard; use \"*.example.com\"", host)
+	}
+	// "*.com" leaves one label; a usable wildcard needs at least two.
+	if strings.Count(strings.TrimPrefix(host, "*."), ".") < 1 {
+		return fmt.Errorf("connect: allowed_hosts entry %q covers an entire top-level domain; list a narrower pattern", host)
+	}
 	return nil
 }

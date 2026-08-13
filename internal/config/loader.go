@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/soulteary/apt-proxy/internal/distro"
 	"github.com/soulteary/apt-proxy/internal/mirrors"
@@ -49,7 +50,10 @@ func ParseFlags() (*Config, error) {
 	}
 
 	// Build CLI configuration with defaults
-	config, ex := buildCLIConfig(flags, DefaultHost, DefaultPort, DefaultCacheDir, DefaultCacheMaxSizeGB, DefaultCacheTTLHours, DefaultCacheCleanupIntervalMin)
+	config, ex, err := buildCLIConfig(flags, DefaultHost, DefaultPort, DefaultCacheDir, DefaultCacheMaxSizeGB, DefaultCacheTTLHours, DefaultCacheCleanupIntervalMin)
+	if err != nil {
+		return nil, err
+	}
 
 	// Set mode (buildCLIConfig may have set it, but we ensure it's set here with validated value)
 	config.Mode = ModeToInt(modeName)
@@ -102,7 +106,10 @@ func ParseFlagsWithConfigFile() (*Config, error) {
 	}
 
 	// Build CLI/ENV configuration
-	cliConfig, ex := buildCLIConfig(flags, "", "", "", 0, 0, 0)
+	cliConfig, ex, err := buildCLIConfig(flags, "", "", "", 0, 0, 0)
+	if err != nil {
+		return nil, err
+	}
 
 	// Merge configurations: file config as base, CLI/ENV as override (honoring
 	// the explicit-set mask so users can override file/defaults with false/0).
@@ -113,6 +120,25 @@ func ParseFlagsWithConfigFile() (*Config, error) {
 	config = applyDefaultsWithExplicit(config, ex)
 
 	return config, nil
+}
+
+// Both CONNECT limits use 0 to mean "off" (unlimited tunnels, no idle
+// reaping), while the tunnel package reads 0 as "apply the built-in
+// default". connectOff translates at every input boundary so the two
+// meanings never meet; inside Config, 0 means "nobody set this".
+func connectOff(value int) int {
+	if value == 0 {
+		return -1
+	}
+	return value
+}
+
+// connectIdleDuration renders the resolved seconds value for the tunnel.
+func connectIdleDuration(seconds int) time.Duration {
+	if seconds < 0 {
+		return -1
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // applyDefaults fills in defaults for unset fields using the conservative
@@ -154,6 +180,16 @@ func applyDefaultsWithExplicit(config *Config, ex *cliExplicit) *Config {
 	if config.Cache.CleanupInterval == 0 && (ex == nil || !ex.CacheCleanupInterval) {
 		config.Cache.CleanupInterval = httpcache.DefaultCleanupInterval
 	}
+
+	// CONNECT defaults. The allowlist is deliberately not defaulted: empty
+	// means deny-all.
+	if config.Connect.MaxConcurrent == 0 && (ex == nil || !ex.ConnectMaxConcurrent) {
+		config.Connect.MaxConcurrent = DefaultConnectMaxConcurrent
+	}
+	if config.Connect.IdleTimeoutSec == 0 && (ex == nil || !ex.ConnectIdleTimeout) {
+		config.Connect.IdleTimeoutSec = DefaultConnectIdleTimeoutSec
+	}
+	config.Connect.IdleTimeout = connectIdleDuration(config.Connect.IdleTimeoutSec)
 
 	// Default storage backend to "disk" when neither YAML nor CLI/ENV
 	// supplied a value, preserving prior behaviour for existing deployments.
